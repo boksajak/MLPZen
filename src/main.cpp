@@ -344,6 +344,7 @@ public:
 
 				const size_t gradientRecordsPerThread = mEnableHighPrecisionGradient ? (mBatchSize / BACKPROP_THREADGROUP_SIZE) : mBatchSize;
 				mNNData.mlpGradientScaler = 1.0f / float(gradientRecordsPerThread);
+				updateHashgridGradientScaler();
 				mNNData.hgGradientScaler = mHashgridGradientScaler;
 
 				mNNData.mainTextureIndex = mTextureToLearn;
@@ -393,10 +394,11 @@ public:
 					{
 						PROFILE(L"Initialize");
 
-						uavBarrier(mNNHashgridBuffer, mMlpCount);
+						transitionBarrier(mNNParametersBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+						transitionBarrier(mNNParametersBackpropBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+						transitionBarrier(mNNHashgridBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 						uavBarrier(mNNGradientBuffer, mMlpCount);
 						uavBarrier(mNNAdamDataBuffer, mMlpCount);
-						uavBarrier(mNNParametersBuffer, mMlpCount);
 
 						uint32_t useNormalDistribution = 0;
 						uint32_t useHeStrategy = 0;
@@ -444,6 +446,11 @@ public:
 						const uint32_t dispatchHeight = utils::divRoundUp(mMlpCount, 1);
 
 						dispatchCompute2D(mInitializationPSO, dispatchWidth, dispatchHeight);
+
+						// Return trainable data to the SRV state used by inference and backpropagation.
+						transitionBarrier(mNNParametersBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+						transitionBarrier(mNNParametersBackpropBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+						transitionBarrier(mNNHashgridBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 					}
 				}
 
@@ -483,10 +490,11 @@ public:
 							{
 								PROFILE(L" Backpropagation");
 
-								uavBarrier(mNNParametersBuffer, mMlpCount);
-								uavBarrier(mNNParametersBackpropBuffer, mMlpCount);
 								uavBarrier(mNNGradientBuffer, mMlpCount);
-								uavBarrier(mNNHashgridBuffer, mMlpCount);
+								if (mCalculateGlobalLoss)
+								{
+									uavBarrier(mLossDataBuffer);
+								}
 
 								const uint32_t dispatchWidth = utils::divRoundUp(mBatchSize, BACKPROP_THREADGROUP_SIZE);
 								const uint32_t dispatchHeight = utils::divRoundUp(mMlpCount, 1);
@@ -507,9 +515,10 @@ public:
 								PROFILE(L" Optimization");
 
 								uavBarrier(mNNGradientBuffer, mMlpCount);
-								uavBarrier(mNNHashgridBuffer, mMlpCount);
 								uavBarrier(mNNAdamDataBuffer, mMlpCount);
-								uavBarrier(mNNParametersBackpropBuffer, mMlpCount);
+								transitionBarrier(mNNParametersBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+								transitionBarrier(mNNParametersBackpropBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+								transitionBarrier(mNNHashgridBuffer, mMlpCount, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
 								size_t hashgridEncodingQuartetCount = (mInputEncodingType == InputEncodingType::HashGrid ? (mHashgridTotalParameters / 4) : 0);
 								const uint32_t dispatchWidth = utils::divRoundUp(mNNParametersQuartetCount + hashgridEncodingQuartetCount, OPTIMIZATION_THREADGROUP_SIZE);
@@ -517,6 +526,9 @@ public:
 
 								dispatchCompute2D(mOptimizationPSO, dispatchWidth, dispatchHeight);
 
+								transitionBarrier(mNNParametersBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+								transitionBarrier(mNNParametersBackpropBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+								transitionBarrier(mNNHashgridBuffer, mMlpCount, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 								uavBarrier(mNNAdamDataBuffer, mMlpCount);
 							}
 							mTrainingSteps++;
@@ -530,9 +542,6 @@ public:
 				{
 					PROFILE(L"Inference");
 
-					uavBarrier(mNNParametersBuffer, mMlpCount);
-					uavBarrier(mNNHashgridBuffer, mMlpCount);
-
 					uint32_t dispatchWidth = utils::divRoundUp(mTargetWidth, INFERENCE_THREADGROUP_SIZE);
 					uint32_t dispatchHeight = utils::divRoundUp(mTargetHeight, INFERENCE_THREADGROUP_SIZE);
 
@@ -544,7 +553,7 @@ public:
 			{
 				transitionBarrier(mBackBuffer[mCurrentFrameIndex], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 				transitionBarrier(mOutputBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-				transitionBarrier(mReferenceBuffer, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+				transitionBarrier(mReferenceBuffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
 				// Copy Final output (inference result)
 				{
@@ -564,14 +573,15 @@ public:
 
 				transitionBarrier(mBackBuffer[mCurrentFrameIndex], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 				transitionBarrier(mOutputBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-				transitionBarrier(mReferenceBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+				transitionBarrier(mReferenceBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 			}
 		}
 
 		// Fetch and calculate NN loss
 		float currentLoss[MAX_MLPS];
 		unsigned int totalLossRecords[MAX_MLPS];
-		memset(currentLoss, 0, sizeof(float) * MAX_MLPS);
+		memset(currentLoss, 0, sizeof(currentLoss));
+		memset(totalLossRecords, 0, sizeof(totalLossRecords));
 		if (mCalculateGlobalLoss)
 		{
 			D3D12_RANGE range;
@@ -656,9 +666,9 @@ private:
 		int i = 0;
 		IDXGIAdapter1* adapter = nullptr;
 		DXGI_ADAPTER_DESC1 selectedAdapterDesc = {};
-		while (mDxgiFactory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND)
+		while (SUCCEEDED(mDxgiFactory->EnumAdapters1(i, &adapter)))
 		{
-			ID3D12Device5* tempDevice;
+			ID3D12Device5* tempDevice = nullptr;
 
 			if (SUCCEEDED(D3D12CreateDevice(adapter, kDx12FeatureLevel, IID_PPV_ARGS(&tempDevice))))
 			{
@@ -671,13 +681,16 @@ private:
 
 					if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
 						selectedAdapterDesc = desc;
+						SAFE_RELEASE(tempDevice);
+						SAFE_RELEASE(adapter);
 						break;
 					}
 				}
-				SAFE_RELEASE(tempDevice);
-				adapter->Release();
-				i++;
 			}
+
+			SAFE_RELEASE(tempDevice);
+			SAFE_RELEASE(adapter);
+			i++;
 		}
 
 		// Create D3D Device
@@ -916,7 +929,7 @@ private:
 		// Create constant buffer
 		{
 			mNNDataCBSize = ALIGN(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, sizeof(mNNData));
-			createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, mNNDataCBSize, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mNNDataCB);
+			createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, mNNDataCBSize, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, &mNNDataCB);
 
 			UINT64 uploadBufferSize = GetRequiredIntermediateSize(mNNDataCB, 0, 1);
 			uploadBufferSize = ALIGN(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, uploadBufferSize);
@@ -925,8 +938,20 @@ private:
 
 		// Create buffer for loss
 		{
-			createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, mLossBufferSize * sizeof(int), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mLossDataBuffer);
+			createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, mLossBufferSize * sizeof(int), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mLossDataBuffer);
 			createBuffer(mDevice, D3D12_HEAP_TYPE_READBACK, 0, mLossBufferSize * sizeof(int), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, &mLossDataReadbackBuffer);
+
+			// The UI can read this buffer before the first GPU copy has completed.
+			D3D12_RANGE readRange = { 0, 0 };
+			void* mappedData = nullptr;
+			HRESULT hr = mLossDataReadbackBuffer->Map(0, &readRange, &mappedData);
+			utils::validate(hr, L"Error: failed to initialize loss readback buffer!");
+			if (SUCCEEDED(hr))
+			{
+				memset(mappedData, 0, mLossBufferSize * sizeof(int));
+				D3D12_RANGE writtenRange = { 0, SIZE_T(mLossBufferSize * sizeof(int)) };
+				mLossDataReadbackBuffer->Unmap(0, &writtenRange);
+			}
 		}
 
 		// Create target image used for training
@@ -969,6 +994,7 @@ private:
 			// Create the DXR output buffer UAV
 			{
 				D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+				uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 				mDevice->CreateUnorderedAccessView(mOutputBuffer, nullptr, &uavDesc, getDescriptorHandle(UINT(DescriptorHeapConstants::Output)));
 			}
@@ -976,6 +1002,7 @@ private:
 			// Create the reference buffer UAV
 			{
 				D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+				uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 				uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
 				mDevice->CreateUnorderedAccessView(mReferenceBuffer, nullptr, &uavDesc, getDescriptorHandle(UINT(DescriptorHeapConstants::Reference)));
 			}
@@ -1184,7 +1211,7 @@ private:
 			}
 
 			if (mInputEncodingType == InputEncodingType::Frequency) {
-				if (ImGui::SliderInt("Frequencies", &mFrequencies, 2, 16)) {
+				if (ImGui::SliderInt("Frequencies", &mFrequencies, 2, mFrequenciesLimit)) {
 					mFrequencies = ALIGN(2, mFrequencies);
 					mNNArchitectureDirty = true;
 				}
@@ -1426,7 +1453,8 @@ private:
 			(mAllocatedParamSize != nnParameterSize) || 
 			(mAllocatedMlpCount != mMlpCount) || 
 			(!mNNParametersBuffer[0]) || 
-			(mNNParametersQuartetCount != nnParametersQuartetsCount);
+			(mNNParametersQuartetCount != nnParametersQuartetsCount) ||
+			(mHashgridTotalAllocatedParameters != mHashgridTotalParameters);
 				
 		if (needsReallocation)
 		{
@@ -1447,8 +1475,8 @@ private:
 				// Create buffers
 				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnParametersBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mNNParametersBuffer[mlp]);
 				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnParametersBackpropBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mNNParametersBackpropBuffer[mlp]);
-				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnAdamDataBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mNNAdamDataBuffer[mlp]);
-				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnGradientBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &mNNGradientBuffer[mlp]);
+				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnAdamDataBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mNNAdamDataBuffer[mlp]);
+				createBuffer(mDevice, D3D12_HEAP_TYPE_DEFAULT, 0, nnGradientBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mNNGradientBuffer[mlp]);
 
 				// Create UAVs for NN parameters, Adam data and gradient
 				{
@@ -1621,6 +1649,29 @@ private:
 			}
 		}
 
+		// Descriptor tables cover MAX_MLPS entries. Keep the unused entries valid for
+		// resource-binding tiers that require every table entry to be populated.
+		const DescriptorHeapConstants mlpDescriptorRanges[] = {
+			DescriptorHeapConstants::NNParametersOutputBuffer,
+			DescriptorHeapConstants::NNAdamDataBuffer,
+			DescriptorHeapConstants::NNGradientBuffer,
+			DescriptorHeapConstants::NNParametersBackpropOutputBuffer,
+			DescriptorHeapConstants::NNParametersInputBuffer,
+			DescriptorHeapConstants::NNParametersBackpropInputBuffer,
+			DescriptorHeapConstants::NNHashgridInputBuffer,
+			DescriptorHeapConstants::NNHashgridOutputBuffer
+		};
+		for (int mlp = mMlpCount; mlp < MAX_MLPS; mlp++)
+		{
+			for (const DescriptorHeapConstants rangeStart : mlpDescriptorRanges)
+			{
+				mDevice->CopyDescriptorsSimple(1,
+					getDescriptorHandle(UINT(rangeStart) + mlp),
+					getDescriptorHandle(UINT(rangeStart)),
+					D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+			}
+		}
+
 		// Update MLP size
 		mExactMlpSizeBytes = getExactMLPSizeBytes();
 	}
@@ -1727,6 +1778,9 @@ private:
 			compilerFlags.push_back(L"/D INPUT_LENGTH=2");
 		}
 
+		// Clamp encoding settings before using them in shader macros.
+		getInputLayerNeuronCount(mInputDimensions);
+
 		compilerFlags.push_back((std::wstring(L"/D NUM_FREQUENCIES=") + std::to_wstring(mFrequencies)).c_str());
 		compilerFlags.push_back((std::wstring(L"/D NUM_ONEBLOB_BINS=") + std::to_wstring(mOneBlobBins)).c_str());
 		compilerFlags.push_back((std::wstring(L"/D PI=") + std::to_wstring(glm::pi<float>())).c_str());
@@ -1765,6 +1819,10 @@ private:
 		} else if (mOutputActivationFunctionType == ActivationFunctionType::None) {
 			compilerFlags.push_back(L"/D OUTPUT_NONE=1");
 		}
+
+		compilerFlags.push_back(mExampleType == ExampleType::LearnCosine
+			? L"/D OUTPUT_MASK=float4(1.0f,0.0f,0.0f,0.0f)"
+			: L"/D OUTPUT_MASK=float4(1.0f,1.0f,1.0f,0.0f)");
 		
 		// Encode hashgrid setup
 		{
@@ -1900,6 +1958,24 @@ private:
 		mCmdList->ResourceBarrier(1, &barrier);
 	}
 
+	void transitionBarrier(ID3D12Resource** resources, int resourceCount, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+		assert(resourceCount <= MAX_MLPS);
+		D3D12_RESOURCE_BARRIER barriers[MAX_MLPS];
+
+		for (int i = 0; i < resourceCount; i++)
+		{
+			barriers[i] = {};
+			barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[i].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+			barriers[i].Transition.pResource = resources[i];
+			barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			barriers[i].Transition.StateBefore = from;
+			barriers[i].Transition.StateAfter = to;
+		}
+
+		mCmdList->ResourceBarrier(resourceCount, barriers);
+	}
+
 	void uavBarrier(ID3D12Resource* resource) {
 		D3D12_RESOURCE_BARRIER barrier = {};
 		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -1937,7 +2013,7 @@ private:
 
 	D3D12_CPU_DESCRIPTOR_HANDLE getDescriptorHandle(UINT index) {
 		D3D12_CPU_DESCRIPTOR_HANDLE handle = mDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-		handle.ptr += (mRtvDescSize * index);
+		handle.ptr += (mCbvSrvUavDescSize * index);
 		return handle;
 	}
 
@@ -2005,7 +2081,7 @@ private:
 
 		// SRV space 1 range
 		SRV1Start = TargetTexture,
-		SRV1End = TargetTexture + MAX_TEXTURES,
+		SRV1End = TargetTexture + MAX_TEXTURES - 1,
 		SRV1Total = SRV1End - SRV1Start + 1,
 
 		// SRV space 2 range
@@ -2181,10 +2257,13 @@ private:
 
 	void uploadConstantBuffer() {
 
-		transitionBarrier(mNNDataCB, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+		transitionBarrier(mNNDataCB, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_DEST);
+
+		BYTE constantBufferData[ALIGN(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, sizeof(NNData))] = {};
+		memcpy(constantBufferData, &mNNData, sizeof(mNNData));
 
 		D3D12_SUBRESOURCE_DATA bufferDataDesc = {};
-		bufferDataDesc.pData = &mNNData;
+		bufferDataDesc.pData = constantBufferData;
 		bufferDataDesc.RowPitch = mNNDataCBSize;
 		bufferDataDesc.SlicePitch = bufferDataDesc.RowPitch;
 
@@ -2192,7 +2271,7 @@ private:
 		HRESULT hr = (mNNDataCBSize == uploadedBytes ? S_OK : E_FAIL);
 		utils::validate(hr, L"Error: failed to update constant buffer!");
 
-		transitionBarrier(mNNDataCB, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		transitionBarrier(mNNDataCB, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
 	}
 
 	void createBuffer(ID3D12Device* device, D3D12_HEAP_TYPE heapType, UINT64 alignment, UINT64 size, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state, ID3D12Resource** ppResource)
@@ -2392,6 +2471,11 @@ private:
 
 	int getInputLayerNeuronCount(const int nInputs)
 	{
+		mFrequenciesLimit = mMaxNeuronsPerLayerLimit / (nInputs * 2);
+		mOneBlobBinsLimit = (mMaxNeuronsPerLayerLimit / nInputs) / 4 * 4;
+		mFrequencies = glm::min(mFrequencies, mFrequenciesLimit);
+		mOneBlobBins = glm::min(mOneBlobBins, mOneBlobBinsLimit);
+
 		int inputNeurons = 0;
 		if (mInputEncodingType == InputEncodingType::Identity) {
 			inputNeurons = nInputs;
@@ -2402,9 +2486,6 @@ private:
 		} else if (mInputEncodingType == InputEncodingType::HashGrid) {
 			inputNeurons = mHashgridLevels * getHgFeatureVectorLength();
 		}
-
-		mFrequenciesLimit = mMaxNeuronsPerLayerLimit / (nInputs * 2);
-		mOneBlobBinsLimit = (mMaxNeuronsPerLayerLimit / nInputs);
 
 		inputNeurons = ALIGN(4, inputNeurons);
 
@@ -2481,7 +2562,6 @@ private:
 		assert(inputDimensions == 2 || inputDimensions == 3);
 
 		mHashgridTotalParameters = 0;
-		mHashgridGradientScaler = 0.0f;
 
 		size_t levelResolution = mHashgridBaseResolution;
 
@@ -2512,16 +2592,36 @@ private:
 				mHashgridLevelResolution[actualLevelIndex] = levelResolution;
 
 				mHashgridTotalParameters += levelParameters;
-				mHashgridGradientScaler += glm::max(1.0f, float(mBatchSize) / float(levelFeatureVectors));
 				actualLevelIndex++;
 			}
 
 			levelResolution *= 2;
 		}
 
-		mHashgridGradientScaler = 1.0f / (mHashgridGradientScaler / float(mHashgridLevels * actualLevelsPerStep));
+		mHashgridActualLevels = actualLevelIndex;
+		updateHashgridGradientScaler();
 
-	}
+    }
+
+    void updateHashgridGradientScaler()
+    {
+        if (mHashgridActualLevels == 0)
+            return;
+
+        mHashgridGradientScaler = 0.0f;
+        const size_t totalFeatureVectors = mHashgridTotalParameters / 4;
+
+        for (int level = 0; level < mHashgridActualLevels; level++)
+        {
+            const size_t nextLevelOffset = (level + 1 < mHashgridActualLevels)
+                ? mHashgridLevelOffset[level + 1]
+                : totalFeatureVectors;
+            const size_t levelFeatureVectors = nextLevelOffset - mHashgridLevelOffset[level];
+            mHashgridGradientScaler += glm::max(1.0f, float(mBatchSize) / float(levelFeatureVectors));
+        }
+
+        mHashgridGradientScaler = float(mHashgridActualLevels) / mHashgridGradientScaler;
+    }
 
 	// Dx12 Boilerplate things
 	ID3D12DescriptorHeap* imguiSrvDescHeap = nullptr;
@@ -2639,6 +2739,7 @@ private:
 	bool mUseFP16Hashgrid = true;
 	bool mHashgridTotalAllocatedFP16 = mUseFP16Hashgrid;
 	int mHashgridLevels = 4;
+	int mHashgridActualLevels = 0;
 	int mHashgridBaseResolution = 16;
 	int mHashgridMapSize = 4096;
 	float mHashgridGradientScaler = 1.0f;

@@ -420,9 +420,10 @@ void accumulateGradient(RWStructuredBuffer<int4> gradientTarget, const uint grad
 // Hashgrid weights have different gradient index in every thread, so you need to use a thread-based version for those.
 void accumulateGradientWave(RWStructuredBuffer<int4> gradientTarget, const uint gradientIndex, float4 gradient)
 {
+    const float4 totalWaveGradient = WaveActiveSum(gradient);
+
     if (WaveIsFirstLane())
     {
-        const float4 totalWaveGradient = WaveActiveSum(gradient);
         float4 avgWaveGradient = totalWaveGradient / float(BACKPROP_THREADGROUP_SIZE);
 
 #if CLIP_GRADIENT
@@ -1083,6 +1084,12 @@ void Initialize(
     const uint linearIndex = LaunchIndex.x;
     const uint mlpIndex = LaunchIndex.y;
 
+    if (linearIndex == 0)
+    {
+        lossData[mlpIndex * 2 + 0] = 0;
+        lossData[mlpIndex * 2 + 1] = 0;
+    }
+
     // Initialize RNG
     uint rng = initRNG(linearIndex, gData.frameNumber);
 
@@ -1187,6 +1194,18 @@ void Initialize(
             }
 
             nnParametersOutputBuffer[mlpIndex][linearIndex] = initialWeight;
+
+            // Keep the transposed layout used by backpropagation in sync after initialization.
+            // The memory map contains valid destinations for weights and uint(-1) for unused entries.
+            const uint4 targetIndices = nnMemoryLayoutMap[linearIndex];
+            for (int i = 0; i < 4; i++)
+            {
+                const uint targetIndex = targetIndices[i];
+                if (targetIndex != uint(-1))
+                {
+                    nnParametersBackpropOutputBuffer[mlpIndex][targetIndex] = float(initialWeight[i]);
+                }
+            }
         }
         else
         {
@@ -1229,7 +1248,13 @@ void backpropLayer(const uint mlpIndex, const float3 target, inout float4 activa
         if (layerType == OUTPUT_LAYER)
         {
             // For output layer, calculate derivative of the loss function
-            const float4 l2LossDeriv = (neuronActivation - float4(target, 0.0f));
+            float4 l2LossDeriv = (neuronActivation - float4(target, 0.0f));
+
+            if (neuron == (currentLayerActivationsOffset + neuronQuartetCountCurrentLayer - 1))
+            {
+                l2LossDeriv *= OUTPUT_MASK;
+            }
+
             dCost_O = l2LossDeriv;
 
             #if CALCULATE_GLOBAL_LOSS
@@ -1283,7 +1308,7 @@ void backpropLayer(const uint mlpIndex, const float3 target, inout float4 activa
     if (layerType == OUTPUT_LAYER)
     {
         #if CALCULATE_GLOBAL_LOSS
-            totalLoss /= float(neuronQuartetCountCurrentLayer * 4);
+            totalLoss /= float((neuronQuartetCountCurrentLayer - 1) * 4) + dot(OUTPUT_MASK, 1.0f.xxxx);
             InterlockedAdd(lossData[mlpIndex * 2 + 0], packFloatPositive(totalLoss));
             InterlockedAdd(lossData[mlpIndex * 2 + 1], 1);
         #endif
@@ -1414,24 +1439,24 @@ void Optimization(
 
 #if USE_HASHGRID_ENCODING
 
-    if (linearIndex >= HG_OFFSET && !gRootConstants.freezeHashgrid)
+    if (linearIndex >= HG_OFFSET)
     {
-        // Update hashgrid params
         const uint hgLinearQuartetIndex = linearIndex - HG_OFFSET;
         if (hgLinearQuartetIndex < HG_TOTAL_QUARTETS)
         {
-            const float4 gradient = unpackFloat4(nnGradientBuffer[mlpIndex][linearIndex]) * gData.hgGradientScaler;
+            if (!gRootConstants.freezeHashgrid)
+            {
+                const float4 gradient = unpackFloat4(nnGradientBuffer[mlpIndex][linearIndex]) * gData.hgGradientScaler;
 
-            float4 hgParameter = nnHashgridOutputBuffer[mlpIndex][hgLinearQuartetIndex];
+                float4 hgParameter = nnHashgridOutputBuffer[mlpIndex][hgLinearQuartetIndex];
 #if USE_SGD_OPTIMIZER
-            hgParameter += -gRootConstants.learningRate * gradient;
+                hgParameter += -gRootConstants.learningRate * gradient;
 #else
-            hgParameter += AdamOptimizer(mlpIndex, gradient, linearIndex);
+                hgParameter += AdamOptimizer(mlpIndex, gradient, linearIndex);
 #endif
-            // Update the parameter
-            nnHashgridOutputBuffer[mlpIndex][hgLinearQuartetIndex] = HG_FLOAT4_STORAGE_TYPE(hgParameter);
+                nnHashgridOutputBuffer[mlpIndex][hgLinearQuartetIndex] = HG_FLOAT4_STORAGE_TYPE(hgParameter);
+            }
 
-            // Clear the gradient
             nnGradientBuffer[mlpIndex][linearIndex] = 0;
         }
     }
@@ -1441,10 +1466,12 @@ void Optimization(
     // Update MLP params
     uint layer;
     bool isWeight;
-    if (getParamQuartetInfo(linearIndex, layer, isWeight) && !gRootConstants.freezeMLP)
+    const bool isMLPParameter = getParamQuartetInfo(linearIndex, layer, isWeight);
+    if (isMLPParameter && !gRootConstants.freezeMLP)
     {
         const float4 gradient = unpackFloat4MLP(nnGradientBuffer[mlpIndex][linearIndex]) * gData.mlpGradientScaler;
 
+        // Update the parameter
         float4 nnParameter = nnParametersOutputBuffer[mlpIndex][linearIndex];
 #if USE_SGD_OPTIMIZER
         nnParameter += -gRootConstants.learningRate * gradient;
@@ -1452,11 +1479,9 @@ void Optimization(
         nnParameter += AdamOptimizer(mlpIndex, gradient, linearIndex);
 #endif
 
-        // Update the parameter
-        nnParametersOutputBuffer[mlpIndex][linearIndex] = MLP_FLOAT4_TYPE(nnParameter);
-
-        // Clear the gradient
-        nnGradientBuffer[mlpIndex][linearIndex] = 0;
+        // Store the exact same (possibly FP16-quantized) value in both layouts.
+        const MLP_FLOAT4_TYPE storedParameter = MLP_FLOAT4_TYPE(nnParameter);
+        nnParametersOutputBuffer[mlpIndex][linearIndex] = storedParameter;
 
         // Write out weights for backprop pass
         {
@@ -1466,19 +1491,26 @@ void Optimization(
                 const uint targetIndex = targetIndices[i];
                 if (targetIndex != uint(-1))
                 {
-                    nnParametersBackpropOutputBuffer[mlpIndex][targetIndex] = nnParameter[i];
+                    nnParametersBackpropOutputBuffer[mlpIndex][targetIndex] = float(storedParameter[i]);
                 }
             }
         }
     }
 
-    // Clear global loss
+    if (isMLPParameter)
     {
-        #if CALCULATE_GLOBAL_LOSS
-            lossData[mlpIndex * 2 + 0] = 0;
-            lossData[mlpIndex * 2 + 1] = 0;
-        #endif
+        // Clear the gradient
+        nnGradientBuffer[mlpIndex][linearIndex] = 0;
     }
+
+    // Clear global loss
+#if CALCULATE_GLOBAL_LOSS
+    if (linearIndex == 0)
+    {
+        lossData[mlpIndex * 2 + 0] = 0;
+        lossData[mlpIndex * 2 + 1] = 0;
+    }
+#endif
 }
 
 // =========================================================================
